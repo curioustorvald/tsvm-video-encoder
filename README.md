@@ -60,11 +60,11 @@ Options:
 
 2. **Audio Processing**: If audio is present:
    - Converts to MP2 format at 32kHz
-   - Uses optimal bitrate (256k) and psychoacoustic model
+   - Uses optimal bitrate (224k) and psychoacoustic model
    - Creates temporary file for muxing
 
 3. **Video Processing**: 
-   - Scales video to specified resolution
+   - Scales and crops video to specified resolution
    - Converts to raw RGB24 format
    - Pipes directly to encoder
 
