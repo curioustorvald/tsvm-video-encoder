@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <getopt.h>
+#include <sys/time.h>
 
 // TVDOS Movie format constants
 #define TVDOS_MAGIC "\x1F\x54\x53\x56\x4D\x4D\x4F\x56"  // "\x1FTSVM MOV"
@@ -59,10 +60,20 @@ typedef struct {
     int mp2_packet_size;
     int mp2_rate_index;
     size_t audio_remaining;
+    int audio_frames_in_buffer;
+    int target_audio_buffer_size;
     
     // FFmpeg processes
     FILE *ffmpeg_video_pipe;
     FILE *ffmpeg_audio_pipe;
+    
+    // Progress tracking
+    struct timeval start_time;
+    struct timeval last_progress_time;
+    size_t total_output_bytes;
+    
+    // Dithering mode
+    int dither_mode;
 } encoder_config_t;
 
 // CORRECTED YCoCg conversion matching Kotlin implementation
@@ -70,12 +81,12 @@ typedef struct {
     float y, co, cg;
 } ycocg_t;
 
-static ycocg_t rgb_to_ycocg_correct(uint8_t r, uint8_t g, uint8_t b) {
+static ycocg_t rgb_to_ycocg_correct(uint8_t r, uint8_t g, uint8_t b, float ditherThreshold) {
     ycocg_t result;
-    float rf = r / 255.0f;
-    float gf = g / 255.0f;
-    float bf = b / 255.0f;
-    
+    float rf = floor((ditherThreshold / 15.0 + r / 255.0) * 15.0) / 15.0;
+    float gf = floor((ditherThreshold / 15.0 + g / 255.0) * 15.0) / 15.0;
+    float bf = floor((ditherThreshold / 15.0 + b / 255.0) * 15.0) / 15.0;
+
     // CORRECTED: Match Kotlin implementation exactly
     float co = rf - bf;           // co = r - b    [-1..1]
     float tmp = bf + co / 2.0f;   // tmp = b + co/2
@@ -206,7 +217,7 @@ static int start_audio_conversion(encoder_config_t *config) {
     
     char command[2048];
     snprintf(command, sizeof(command),
-        "ffmpeg -i \"%s\" -acodec libtwolame -psymodel 4 -b:a 224k -ar %d -y \"%s\" 2>/dev/null",
+        "ffmpeg -i \"%s\" -acodec libtwolame -psymodel 4 -b:a 192k -ar %d -ac 2 -y \"%s\" 2>/dev/null",
         config->input_file, MP2_SAMPLE_RATE, TEMP_AUDIO_FILE);
     
     int result = system(command);
@@ -295,9 +306,37 @@ static size_t gzip_compress(uint8_t *src, size_t src_len, uint8_t *dst, size_t d
     return compressed_size;
 }
 
+// Bayer dithering kernels (4 patterns, each 4x4)
+static const float bayerKernels[4][16] = {
+    { // Pattern 0
+        (0.0f + 0.5f) / 16.0f, (8.0f + 0.5f) / 16.0f, (2.0f + 0.5f) / 16.0f, (10.0f + 0.5f) / 16.0f,
+        (12.0f + 0.5f) / 16.0f, (4.0f + 0.5f) / 16.0f, (14.0f + 0.5f) / 16.0f, (6.0f + 0.5f) / 16.0f,
+        (3.0f + 0.5f) / 16.0f, (11.0f + 0.5f) / 16.0f, (1.0f + 0.5f) / 16.0f, (9.0f + 0.5f) / 16.0f,
+        (15.0f + 0.5f) / 16.0f, (7.0f + 0.5f) / 16.0f, (13.0f + 0.5f) / 16.0f, (5.0f + 0.5f) / 16.0f
+    },
+    { // Pattern 1
+        (8.0f + 0.5f) / 16.0f, (2.0f + 0.5f) / 16.0f, (10.0f + 0.5f) / 16.0f, (0.0f + 0.5f) / 16.0f,
+        (4.0f + 0.5f) / 16.0f, (14.0f + 0.5f) / 16.0f, (6.0f + 0.5f) / 16.0f, (12.0f + 0.5f) / 16.0f,
+        (11.0f + 0.5f) / 16.0f, (1.0f + 0.5f) / 16.0f, (9.0f + 0.5f) / 16.0f, (3.0f + 0.5f) / 16.0f,
+        (7.0f + 0.5f) / 16.0f, (13.0f + 0.5f) / 16.0f, (5.0f + 0.5f) / 16.0f, (15.0f + 0.5f) / 16.0f
+    },
+    { // Pattern 2
+        (7.0f + 0.5f) / 16.0f, (13.0f + 0.5f) / 16.0f, (5.0f + 0.5f) / 16.0f, (15.0f + 0.5f) / 16.0f,
+        (8.0f + 0.5f) / 16.0f, (2.0f + 0.5f) / 16.0f, (10.0f + 0.5f) / 16.0f, (0.0f + 0.5f) / 16.0f,
+        (4.0f + 0.5f) / 16.0f, (14.0f + 0.5f) / 16.0f, (6.0f + 0.5f) / 16.0f, (12.0f + 0.5f) / 16.0f,
+        (11.0f + 0.5f) / 16.0f, (1.0f + 0.5f) / 16.0f, (9.0f + 0.5f) / 16.0f, (3.0f + 0.5f) / 16.0f
+    },
+    { // Pattern 3
+        (15.0f + 0.5f) / 16.0f, (7.0f + 0.5f) / 16.0f, (13.0f + 0.5f) / 16.0f, (5.0f + 0.5f) / 16.0f,
+        (0.0f + 0.5f) / 16.0f, (8.0f + 0.5f) / 16.0f, (2.0f + 0.5f) / 16.0f, (10.0f + 0.5f) / 16.0f,
+        (12.0f + 0.5f) / 16.0f, (4.0f + 0.5f) / 16.0f, (14.0f + 0.5f) / 16.0f, (6.0f + 0.5f) / 16.0f,
+        (3.0f + 0.5f) / 16.0f, (11.0f + 0.5f) / 16.0f, (1.0f + 0.5f) / 16.0f, (9.0f + 0.5f) / 16.0f
+    }
+};
+
 // CORRECTED: Encode a 4x4 block to iPF1 format matching Kotlin implementation
-static void encode_ipf1_block_correct(uint8_t *rgb_data, int width, int block_x, int block_y, 
-                                     int channels, uint8_t *output) {
+static void encode_ipf1_block_correct(uint8_t *rgb_data, int width, int height, int block_x, int block_y,
+                                     int channels, int pattern, uint8_t *output) {
     ycocg_t pixels[16];
     int y_values[16];
     float co_values[16];  // Keep full precision for subsampling
@@ -308,14 +347,15 @@ static void encode_ipf1_block_correct(uint8_t *rgb_data, int width, int block_x,
         for (int px = 0; px < 4; px++) {
             int src_x = block_x * 4 + px;
             int src_y = block_y * 4 + py;
+            float t = (pattern < 0) ? 0.0f : bayerKernels[pattern % 4][4 * (py % 4) + (px % 4)];
             int idx = py * 4 + px;
             
-            if (src_x < width && src_y < 448) {
+            if (src_x < width && src_y < height) {
                 int pixel_offset = (src_y * width + src_x) * channels;
                 uint8_t r = rgb_data[pixel_offset];
                 uint8_t g = rgb_data[pixel_offset + 1];
                 uint8_t b = rgb_data[pixel_offset + 2];
-                pixels[idx] = rgb_to_ycocg_correct(r, g, b);
+                pixels[idx] = rgb_to_ycocg_correct(r, g, b, t);
             } else {
                 pixels[idx] = (ycocg_t){0.0f, 0.0f, 0.0f};
             }
@@ -409,7 +449,7 @@ static int is_significantly_different(uint8_t *block_a, uint8_t *block_b) {
 }
 
 // Encode iPF1 frame to buffer
-static void encode_ipf1_frame(uint8_t *rgb_data, int width, int height, int channels, 
+static void encode_ipf1_frame(uint8_t *rgb_data, int width, int height, int channels, int pattern,
                              uint8_t *ipf_buffer) {
     int blocks_per_row = (width + 3) / 4;
     int blocks_per_col = (height + 3) / 4;
@@ -418,7 +458,7 @@ static void encode_ipf1_frame(uint8_t *rgb_data, int width, int height, int chan
         for (int block_x = 0; block_x < blocks_per_row; block_x++) {
             int block_index = block_y * blocks_per_row + block_x;
             uint8_t *output_block = ipf_buffer + block_index * IPF_BLOCK_SIZE;
-            encode_ipf1_block_correct(rgb_data, width, block_x, block_y, channels, output_block);
+            encode_ipf1_block_correct(rgb_data, width, height, block_x, block_y, channels, pattern, output_block);
         }
     }
 }
@@ -473,25 +513,100 @@ static size_t encode_ipf1_delta(uint8_t *previous_frame, uint8_t *current_frame,
     return output_ptr - delta_buffer;
 }
 
+// Get current time in seconds
+static double get_current_time_sec(struct timeval *tv) {
+    gettimeofday(tv, NULL);
+    return tv->tv_sec + tv->tv_usec / 1000000.0;
+}
+
+// Display progress information similar to FFmpeg
+static void display_progress(encoder_config_t *config, int frame_num) {
+    struct timeval current_time;
+    double current_sec = get_current_time_sec(&current_time);
+    
+    // Only update progress once per second
+    double last_progress_sec = config->last_progress_time.tv_sec + config->last_progress_time.tv_usec / 1000000.0;
+    if (current_sec - last_progress_sec < 1.0) {
+        return;
+    }
+    
+    config->last_progress_time = current_time;
+    
+    // Calculate timing
+    double start_sec = config->start_time.tv_sec + config->start_time.tv_usec / 1000000.0;
+    double elapsed_sec = current_sec - start_sec;
+    double current_video_time = (double)frame_num / config->fps;
+    double fps = frame_num / elapsed_sec;
+    double speed = (elapsed_sec > 0) ? current_video_time / elapsed_sec : 0.0;
+    double bitrate = (elapsed_sec > 0) ? (config->total_output_bytes * 8.0 / 1000.0) / elapsed_sec : 0.0;
+    
+    // Format output size in human readable format
+    char size_str[32];
+    if (config->total_output_bytes >= 1024 * 1024) {
+        snprintf(size_str, sizeof(size_str), "%.1fMB", config->total_output_bytes / (1024.0 * 1024.0));
+    } else if (config->total_output_bytes >= 1024) {
+        snprintf(size_str, sizeof(size_str), "%.1fkB", config->total_output_bytes / 1024.0);
+    } else {
+        snprintf(size_str, sizeof(size_str), "%zuB", config->total_output_bytes);
+    }
+    
+    // Format current time as HH:MM:SS.xx
+    int hours = (int)(current_video_time / 3600);
+    int minutes = (int)((current_video_time - hours * 3600) / 60);
+    double seconds = current_video_time - hours * 3600 - minutes * 60;
+    
+    // Print progress line (overwrite previous line)
+    fprintf(stderr, "\rframe=%d fps=%.1f size=%s time=%02d:%02d:%05.2f bitrate=%.1fkbits/s speed=%4.2fx", 
+            frame_num, fps, size_str, hours, minutes, seconds, bitrate, speed);
+    fflush(stderr);
+}
+
 // Process audio for current frame
 static int process_audio(encoder_config_t *config, int frame_num, FILE *output) {
     if (!config->has_audio || !config->mp2_file || config->audio_remaining <= 0) {
         return 1;
     }
     
-    int repeat_count = (frame_num == 1) ? 2 : 1;
-    
-    for (int q = 0; q < repeat_count; q++) {
-        if (config->mp2_packet_size == 0) {
-            uint8_t header[4];
-            if (fread(header, 1, 4, config->mp2_file) != 4) break;
-            fseek(config->mp2_file, 0, SEEK_SET);
-            
-            config->mp2_packet_size = get_mp2_packet_size(header);
-            int is_mono = (header[3] >> 6) == 3;
-            config->mp2_rate_index = mp2_packet_size_to_rate_index(config->mp2_packet_size, is_mono);
-        }
+    // Initialize packet size on first frame
+    if (config->mp2_packet_size == 0) {
+        uint8_t header[4];
+        if (fread(header, 1, 4, config->mp2_file) != 4) return 1;
+        fseek(config->mp2_file, 0, SEEK_SET);
         
+        config->mp2_packet_size = get_mp2_packet_size(header);
+        int is_mono = (header[3] >> 6) == 3;
+        config->mp2_rate_index = mp2_packet_size_to_rate_index(config->mp2_packet_size, is_mono);
+    }
+    
+    // Calculate how much audio time each frame represents (in seconds)
+    double frame_audio_time = 1.0 / config->fps;
+    
+    // Calculate how much audio time each MP2 packet represents
+    // MP2 frame contains 1152 samples at 32kHz = 0.036 seconds
+    double packet_audio_time = 1152.0 / MP2_SAMPLE_RATE;
+    
+    // Estimate how many packets we consume per video frame
+    double packets_per_frame = frame_audio_time / packet_audio_time;
+    
+    // Only insert audio when buffer would go below 2 frames
+    // Initialize with 2 packets on first frame to prime the buffer
+    int packets_to_insert = 0;
+    if (frame_num == 1) {
+        packets_to_insert = 2;
+        config->audio_frames_in_buffer = 2;
+    } else {
+        // Simulate buffer consumption (packets consumed per frame)
+        config->audio_frames_in_buffer -= (int)ceil(packets_per_frame);
+        
+        // Only insert packets when buffer gets low (≤ 2 frames)
+        if (config->audio_frames_in_buffer <= 2) {
+            packets_to_insert = config->target_audio_buffer_size - config->audio_frames_in_buffer;
+            packets_to_insert = (packets_to_insert > 0) ? packets_to_insert : 1;
+        }
+    }
+    
+    // Insert the calculated number of audio packets
+    for (int q = 0; q < packets_to_insert; q++) {
         size_t bytes_to_read = config->mp2_packet_size;
         if (bytes_to_read > config->audio_remaining) {
             bytes_to_read = config->audio_remaining;
@@ -504,7 +619,10 @@ static int process_audio(encoder_config_t *config, int frame_num, FILE *output) 
         fwrite(audio_packet_type, 1, 2, output);
         fwrite(config->mp2_buffer, 1, bytes_read, output);
         
+        // Track audio bytes written
+        config->total_output_bytes += 2 + bytes_read;
         config->audio_remaining -= bytes_read;
+        config->audio_frames_in_buffer++;
     }
     
     return 1;
@@ -528,6 +646,9 @@ static void write_tvdos_header(encoder_config_t *config, FILE *output) {
     uint16_t audio_queue_info = config->has_audio ? 
         (MP2_DEFAULT_PACKET_SIZE >> 2) | (audio_queue_size << 12) : 0x0000;
     fwrite(&audio_queue_info, 2, 1, output);
+    
+    // Store target buffer size for audio timing
+    config->target_audio_buffer_size = audio_queue_size;
     
     uint8_t reserved[10] = {0};
     fwrite(reserved, 1, 10, output);
@@ -575,7 +696,14 @@ static int process_frame(encoder_config_t *config, int frame_num, int is_keyfram
     }
     
     // Step 2: Encode and write video
-    encode_ipf1_frame(config->rgb_buffer, config->width, config->height, 3, 
+    int pattern;
+    switch (config->dither_mode) {
+        case 0: pattern = -1; break;  // No dithering
+        case 1: pattern = 0; break;   // Static pattern
+        case 2: pattern = frame_num % 4; break;  // Dynamic pattern
+        default: pattern = 0; break;  // Fallback to static
+    }
+    encode_ipf1_frame(config->rgb_buffer, config->width, config->height, 3, pattern,
                      config->current_ipf_frame);
     
     // Determine if we should use delta encoding
@@ -622,13 +750,16 @@ static int process_frame(encoder_config_t *config, int frame_num, int is_keyfram
     uint8_t sync[2] = {SYNC_PACKET_TYPE};
     fwrite(sync, 1, 2, output);
     
+    // Track video bytes written (packet type + size + compressed data + sync)
+    config->total_output_bytes += 2 + 4 + compressed_size + 2;
+    
     // Swap frame buffers
     uint8_t *temp = config->previous_ipf_frame;
     config->previous_ipf_frame = config->current_ipf_frame;
     config->current_ipf_frame = temp;
     
-    fprintf(stderr, "Frame %d: %zu bytes (%s)\n", frame_num, compressed_size,
-           use_delta ? "delta" : "keyframe");
+    // Display progress
+    display_progress(config, frame_num);
     
     return 1;
 }
@@ -657,17 +788,20 @@ static void cleanup_config(encoder_config_t *config) {
 
 // Print usage information
 static void print_usage(const char *program_name) {
-    printf("TVDOS Movie Encoder - Color-Corrected Version\n\n");
+    printf("TVDOS Movie Encoder\n\n");
     printf("Usage: %s [options] input_video\n\n", program_name);
     printf("Options:\n");
     printf("  -o, --output FILE    Output TVDOS movie file (default: stdout)\n");
     printf("  -s, --size WxH       Video resolution (default: 560x448)\n");
+    printf("  -d, --dither MODE    Dithering mode (default: 1)\n");
+    printf("                         0: No dithering\n");
+    printf("                         1: Static pattern\n");
+    printf("                         2: Dynamic pattern (better quality, larger files)\n");
     printf("  -h, --help           Show this help message\n\n");
     printf("Examples:\n");
     printf("  %s input.mp4 -o output.mov\n", program_name);
     printf("  %s input.avi -s 1024x768 -o output.mov\n", program_name);
-    printf("  %s input.mkv > output.mov\n", program_name);
-    printf("\nFixed: YCoCg color transform, chroma quantization, pixel ordering\n");
+    printf("  yt-dlp -o - \"https://youtube.com/watch?v=VIDEO_ID\" | ffmpeg -i pipe:0 -c copy temp.mp4 && %s temp.mp4 -o youtube_video.mov && rm temp.mp4\n", program_name);
 }
 
 int main(int argc, char *argv[]) {
@@ -678,17 +812,19 @@ int main(int argc, char *argv[]) {
     }
     
     config->output_to_stdout = 1; // Default to stdout
+    config->dither_mode = 1; // Default to static dithering
     
     // Parse command line arguments
     static struct option long_options[] = {
         {"output", required_argument, 0, 'o'},
         {"size", required_argument, 0, 's'},
+        {"dither", required_argument, 0, 'd'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
     
     int c;
-    while ((c = getopt_long(argc, argv, "o:s:h", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "o:s:d:h", long_options, NULL)) != -1) {
         switch (c) {
             case 'o':
                 config->output_file = strdup(optarg);
@@ -697,6 +833,14 @@ int main(int argc, char *argv[]) {
             case 's':
                 if (!parse_resolution(optarg, &config->width, &config->height)) {
                     fprintf(stderr, "Invalid resolution format: %s\n", optarg);
+                    cleanup_config(config);
+                    return 1;
+                }
+                break;
+            case 'd':
+                config->dither_mode = atoi(optarg);
+                if (config->dither_mode < 0 || config->dither_mode > 2) {
+                    fprintf(stderr, "Invalid dither mode: %s (must be 0, 1, or 2)\n", optarg);
                     cleanup_config(config);
                     return 1;
                 }
@@ -760,6 +904,11 @@ int main(int argc, char *argv[]) {
     // Write TVDOS header
     write_tvdos_header(config, output);
     
+    // Initialize progress tracking
+    gettimeofday(&config->start_time, NULL);
+    config->last_progress_time = config->start_time;
+    config->total_output_bytes = 8 + 2 + 2 + 2 + 4 + 2 + 2 + 10; // TVDOS header size
+    
     // Process frames with correct order: Audio -> Video -> Sync
     for (int frame = 1; frame <= config->total_frames; frame++) {
         int is_keyframe = (frame == 1) || (frame % 30 == 0);
@@ -772,6 +921,9 @@ int main(int argc, char *argv[]) {
             break;
         }
     }
+    
+    // Final progress update and newline
+    fprintf(stderr, "\n");
     
     if (!config->output_to_stdout) {
         fclose(output);
