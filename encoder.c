@@ -136,54 +136,55 @@ static int get_video_metadata(encoder_config_t *config) {
     char command[1024];
     char *output;
     
-    // Get frame count
-    snprintf(command, sizeof(command), 
-        "ffprobe -v quiet -select_streams v:0 -count_frames -show_entries stream=nb_read_frames -of csv=p=0 \"%s\"", 
-        config->input_file);
-    output = execute_command(command);
-    if (!output) {
-        fprintf(stderr, "Failed to get frame count\n");
-        return 0;
-    }
-    config->total_frames = atoi(output);
-    free(output);
-    
-    // Get frame rate
+    // Get all metadata in a single ffprobe call
     snprintf(command, sizeof(command),
-        "ffprobe -v quiet -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 \"%s\"",
-        config->input_file);
+        "ffprobe -v quiet -count_frames "
+        "-show_entries stream=nb_read_frames,r_frame_rate:format=duration "
+        "-select_streams v:0 -of csv=p=0 \"%s\" 2>/dev/null; "
+        "ffprobe -v quiet -select_streams a:0 -show_entries stream=index -of csv=p=0 \"%s\" 2>/dev/null",
+        config->input_file, config->input_file);
+    
     output = execute_command(command);
     if (!output) {
-        fprintf(stderr, "Failed to get frame rate\n");
+        fprintf(stderr, "Failed to get video metadata\n");
         return 0;
     }
     
-    // Parse framerate (could be "30/1" or "29.97")
-    int num, den;
-    if (sscanf(output, "%d/%d", &num, &den) == 2) {
-        config->fps = (den > 0) ? (num / den) : 30;
-    } else {
-        config->fps = (int)round(atof(output));
+    // Parse the combined output
+    char *line = strtok(output, "\n");
+    int line_num = 0;
+    
+    while (line && line_num < 2) {
+        switch (line_num) {
+            case 0: // Line format: "framerate,framecount" (e.g., "24000/1001,4423")
+                {
+                    char *comma = strchr(line, ',');
+                    if (comma) {
+                        *comma = '\0'; // Split at comma
+                        // Parse frame rate (first part)
+                        int num, den;
+                        if (sscanf(line, "%d/%d", &num, &den) == 2) {
+                            config->fps = (den > 0) ? (int)round((float)num/(float)den) : 30;
+                        } else {
+                            config->fps = (int)round(atof(line));
+                        }
+                        // Parse frame count (second part)
+                        config->total_frames = atoi(comma + 1);
+                    }
+                }
+                break;
+            case 1: // duration in seconds
+                config->duration = atof(line);
+                break;
+        }
+        line = strtok(NULL, "\n");
+        line_num++;
     }
+    
+    // Check for audio stream (will be on line 3 if present)
+    config->has_audio = (line && strlen(line) > 0 && atoi(line) >= 0);
+    
     free(output);
-    
-    // Get duration
-    snprintf(command, sizeof(command),
-        "ffprobe -v quiet -show_entries format=duration -of csv=p=0 \"%s\"",
-        config->input_file);
-    output = execute_command(command);
-    if (output) {
-        config->duration = atof(output);
-        free(output);
-    }
-    
-    // Check if has audio
-    snprintf(command, sizeof(command),
-        "ffprobe -v quiet -select_streams a:0 -show_entries stream=index -of csv=p=0 \"%s\"",
-        config->input_file);
-    output = execute_command(command);
-    config->has_audio = (output && strlen(output) > 0 && atoi(output) >= 0);
-    if (output) free(output);
     
     // Validate frame count using duration if needed
     if (config->total_frames <= 0 && config->duration > 0) {
@@ -538,7 +539,7 @@ static void display_progress(encoder_config_t *config, int frame_num) {
     double current_video_time = (double)frame_num / config->fps;
     double fps = frame_num / elapsed_sec;
     double speed = (elapsed_sec > 0) ? current_video_time / elapsed_sec : 0.0;
-    double bitrate = (elapsed_sec > 0) ? (config->total_output_bytes * 8.0 / 1000.0) / elapsed_sec : 0.0;
+    double bitrate = (elapsed_sec > 0) ? (config->total_output_bytes * 8.0 / 1024.0) / elapsed_sec : 0.0;
     
     // Format output size in human readable format
     char size_str[32];
